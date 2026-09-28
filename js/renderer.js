@@ -27,10 +27,58 @@ function htmlSicher(text) {
   return String(text).replace(/[&<>"']/g, z => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[z]);
 }
 
+// Fremdtest Mission 18: "leichte Schreibfehler werden direkt als nicht zu finden eingestuft".
+// Stimmt - die Ortssuche von Open-Meteo kennt keine Tippfehler (Hamburk, Frankfrut, Münchn: 0 Treffer,
+// per curl geprueft). Nur wenn sie nichts findet, fragen wir deshalb Photon (komoot, Daten von
+// OpenStreetMap, ohne Schluessel), das absichtlich unscharf sucht: 15 von 15 Tippfehlern trafen dort
+// mit dem ersten Vorschlag den richtigen Ort. Ergebnis im selben Format wie Open-Meteo, plus
+// "unscharf: true" - so ein Treffer wird nie automatisch genommen, nur als "Meinten Sie" angeboten.
+async function unscharfSuchen(text, anzahl) {
+  const antwort = await fetch(
+    `https://photon.komoot.io/api/?q=${encodeURIComponent(text)}&limit=${anzahl}&lang=de&layer=city`
+  );
+  if (!antwort.ok) throw new Error(`HTTP ${antwort.status}`);
+  const daten = await antwort.json();
+  return (daten.features || []).map(f => ({
+    name: f.properties.name,
+    latitude: f.geometry.coordinates[1],   // Photon liefert [Laenge, Breite] - umgekehrt als ueblich
+    longitude: f.geometry.coordinates[0],
+    admin1: f.properties.state,
+    country: f.properties.country,
+    unscharf: true,
+  }));
+}
+
 function fehlerZeigen(text) {
   inhaltEl.style.display = "none";
   fehlerEl.style.display = "block";
   fehlerEl.innerHTML = text;
+}
+
+// Gemeinsame Ortssuche fuer Enter/Knopf und Live-Vorschlaege. Open-Meteo zuerst. Heisst dort kein
+// Treffer genau so wie die Eingabe (Tippfehler wie "Frankfrut" = 0 Treffer, aber auch "Münchn" =
+// nur "Münchnerau", "Münchner Freiheit"), kommen Photons Vorschlaege oben dazu. Unter 4 Zeichen
+// nicht, da raet Photon zu wild. Wirft nur, wenn Open-Meteo selbst nicht erreichbar ist.
+async function orteFinden(text, anzahl, beiUnscharf) {
+  const antwort = await fetch(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(text)}&count=${anzahl}&language=de&format=json`
+  );
+  if (!antwort.ok) throw new Error(`HTTP ${antwort.status}`);
+  const daten = await antwort.json();
+  // Wichtig: bei keinem Treffer fehlt das Feld "results" komplett (kein leeres Array!) -
+  // per curl getestet, bevor dieser Fall im Code behandelt wurde.
+  const treffer = daten.results || [];
+  const gleich = t => t.name.toLowerCase() === text.toLowerCase();
+  if (treffer.some(gleich) || text.length < 4) return treffer;
+
+  // Photon braucht ~2,5 s (3 Messungen per curl: 2,2 / 2,7 / 2,5 s). Solange: vorhandene Treffer
+  // schon zeigen (normales Tippen wie "Frank" darf nicht langsamer werden), sonst einen Hinweis -
+  // niemand soll vor einem leeren Feld sitzen und denken, es gibt den Ort nicht.
+  if (beiUnscharf) beiUnscharf(treffer);
+  let unscharf = [];
+  try { unscharf = await unscharfSuchen(text, 3); } catch (e) { console.warn(e); } // Photon aus: wie vorher
+  const schonDa = t => unscharf.some(u => u.name === t.name && u.country === t.country);
+  return [...unscharf, ...treffer.filter(t => !schonDa(t))].slice(0, anzahl);
 }
 
 async function ortSuchen(name) {
@@ -39,23 +87,25 @@ async function ortSuchen(name) {
     return;
   }
   vorschlaegeVerstecken();
+  // Eine noch laufende Live-Suche vom Tippen darf dieses Ergebnis nicht mehr ueberschreiben
+  // (im Browsertest verschwand sonst die "Meinten Sie"-Liste bzw. die Meldung wieder).
+  // Dieselbe Nummer schuetzt auch gegen eine AELTERE Enter-Suche, die erst nach einer neueren
+  // antwortet (Browsertest: "Xqzvbnm" meldete "kein Ort" erst waehrend der Hamburg-Suche).
+  clearTimeout(liveTimer);
+  const eigeneNummer = ++liveZaehler;
 
-  let daten;
+  let treffer;
   try {
-    const antwort = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name.trim())}&count=5&language=de&format=json`
-    );
-    if (!antwort.ok) throw new Error(`HTTP ${antwort.status}`);
-    daten = await antwort.json();
+    treffer = await orteFinden(name.trim(), 5, vorab => { if (eigeneNummer === liveZaehler) zwischenstandZeigen(vorab); });
+    if (eigeneNummer !== liveZaehler) return; // inzwischen neu gesucht oder weitergetippt
   } catch (fehler) {
+    if (eigeneNummer !== liveZaehler) return;
     fehlerZeigen("Ortssuche fehlgeschlagen. Prüfe die Internetverbindung.<br>Quelle: <code>geocoding-api.open-meteo.com</code>.");
     console.error(fehler);
     return;
   }
 
-  // Wichtig: bei keinem Treffer fehlt das Feld "results" komplett (kein leeres Array!) -
-  // per curl getestet, bevor dieser Fall im Code behandelt wurde.
-  if (!daten.results || daten.results.length === 0) {
+  if (treffer.length === 0) {
     // Matthias' Frage zu "<b>Test</b>": fehlerZeigen() schreibt per innerHTML, die Eingabe wurde
     // also als HTML ausgefuehrt (fett, oder mit <img onerror=...> sogar als Skript). Deshalb die
     // Eingabe vorher entschaerfen - der Rest der Meldung bleibt HTML (<br>, <code>).
@@ -67,10 +117,11 @@ async function ortSuchen(name) {
   // sichtbar und ueberlagerte die neue Vorschlagsliste, weil hier nichts sie ausgeblendet hat.
   fehlerEl.style.display = "none";
 
-  if (daten.results.length === 1) {
-    ortWaehlen(daten.results[0]);
+  // Genau ein sicherer Treffer: direkt nehmen. Ein geratener (unscharf) nie ungefragt.
+  if (treffer.length === 1 && !treffer[0].unscharf) {
+    ortWaehlen(treffer[0]);
   } else {
-    vorschlaegeAnzeigen(daten.results);
+    vorschlaegeAnzeigen(treffer);
   }
 }
 
@@ -81,6 +132,7 @@ function vorschlaegeAnzeigen(treffer) {
     const zeile = document.createElement("div");
     const region = [ort.admin1, ort.country].filter(Boolean).join(", ");
     zeile.textContent = region ? `${ort.name} (${region})` : ort.name;
+    if (ort.unscharf && i === 0) zeile.textContent = `Meinten Sie: ${zeile.textContent}?`;
     zeile.dataset.index = i;
     zeile.addEventListener("click", () => ortWaehlen(ort));
     zeile.addEventListener("mouseenter", () => aktivenSetzen(i));
@@ -92,6 +144,16 @@ function vorschlaegeAnzeigen(treffer) {
   } else {
     vorschlaegeVerstecken();
   }
+}
+
+// Zwischenzeile, solange Photon sucht. Nicht anklickbar; liveTreffer leeren, damit Pfeil+Enter
+// in dieser Zeit keinen alten Vorschlag nimmt.
+function zwischenstandZeigen(vorab) {
+  if (vorab.length) { liveTreffer = vorab; vorschlaegeAnzeigen(vorab); return; }
+  liveTreffer = [];
+  aktiverIndex = -1;
+  vorschlaegeEl.innerHTML = '<div class="hinweis">Kein genauer Treffer – suche ähnliche Schreibweisen …</div>';
+  vorschlaegeEl.style.display = "block";
 }
 
 function vorschlaegeVerstecken() {
@@ -126,13 +188,9 @@ function aktivenSetzen(index) {
 async function liveSuche(text) {
   const eigeneNummer = ++liveZaehler;
   try {
-    const antwort = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(text)}&count=6&language=de&format=json`
-    );
-    if (!antwort.ok) return;
-    const daten = await antwort.json();
+    const treffer = await orteFinden(text, 6, vorab => { if (eigeneNummer === liveZaehler) zwischenstandZeigen(vorab); });
     if (eigeneNummer !== liveZaehler) return; // inzwischen wurde weitergetippt, diese Antwort ist veraltet
-    liveTreffer = daten.results || [];
+    liveTreffer = treffer;
     vorschlaegeAnzeigen(liveTreffer);
   } catch {
     // Live-Vorschau bei Netzwerkfehler still ausblenden - die grosse Fehlermeldung ist Enter/Klick vorbehalten
