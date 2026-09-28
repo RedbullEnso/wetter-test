@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Wetter — 7 Tage</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: "Segoe UI", sans-serif;
+    color: white;
+    overflow-y: auto;   /* falls Inhalt doch nicht passt: scrollen statt abschneiden/Rollbalken-Bug */
+    overflow-x: hidden;
+  }
+  body {
+    min-height: 100%;
+    background: linear-gradient(180deg, #4a90d9, #1b4d7a); /* nur bis die erste Hintergrund-Ebene steht */
+    padding: 16px 16px 28px;
+    position: relative;
+  }
+  #inhalt, #fehler { position: relative; z-index: 1; transition: opacity 0.25s ease; }
+  #inhalt.gedimmt { opacity: 0.35; }
+  /* Mission 17: Ortswechsel blendet ab statt zu springen (Rueckkehr auf 1 nach dem neuen Inhalt). */
+  #inhalt.wechsel { opacity: 0.45; }
+
+  /* Mission 18: in grossen Fenstern nicht auf volle Breite zerren, sondern mittig halten. */
+  #suche, #inhalt, #fehler { max-width: 560px; margin-left: auto; margin-right: auto; }
+
+  /* Mission 18: Ladehinweis als eigene Zeile mit fest reservierter Hoehe unter der Suche: er
+     verdeckt nichts (eine schwebende Pille unten hatte eine Tageszeile ueberdeckt) und das Layout
+     springt nicht, weil nur die Sichtbarkeit wechselt, nie der Platz. */
+  #lade-hinweis {
+    visibility: hidden; height: 18px; margin: -8px auto 4px; max-width: 560px;
+    text-align: center; font-size: 12px; opacity: 0.9; position: relative; z-index: 1;
+  }
+
+  /* Mission 18: die Antwort auf "Jacke?" - gross, farbig, direkt unter der Temperatur. */
+  #jacke {
+    margin: 12px auto 0; padding: 8px 16px; border-radius: 12px; display: inline-block;
+    font-size: 17px; max-width: 100%;
+  }
+  #jacke:empty { display: none; }
+  #jacke.ja { background: rgba(255,150,30,0.45); }
+  #jacke.nein { background: rgba(90,200,120,0.4); }
+  #jacke span { display: block; font-size: 12px; opacity: 0.9; margin-top: 2px; }
+
+  /* Suchleiste bewusst ueber #inhalt (z-index 2 statt 1) - sonst ueberdeckt der spaeter im HTML
+     stehende Inhalt die Vorschlagsliste, obwohl die selbst einen hohen z-index hat: z-index wirkt
+     nur innerhalb des eigenen Stapelkontexts, und #suche/#inhalt waren gleichrangige Geschwister. */
+  #suche { display: flex; gap: 8px; margin-bottom: 14px; position: relative; z-index: 2; }
+  #ort-eingabe { min-width: 0; } /* sonst drueckt das Eingabefeld im schmalen Fenster den Knopf raus */
+  #ort-eingabe {
+    flex: 1; padding: 10px 14px; border-radius: 10px; border: none; font-size: 14px;
+    background: rgba(255,255,255,0.18); color: white; outline: none;
+  }
+  #ort-eingabe::placeholder { color: rgba(255,255,255,0.7); }
+  #such-knopf {
+    padding: 10px 16px; border-radius: 10px; border: none; font-size: 14px; cursor: pointer;
+    background: rgba(255,255,255,0.25); color: white;
+  }
+  #vorschlaege {
+    position: absolute; top: 42px; left: 0; right: 60px; z-index: 5;
+    background: #1e2b3a; border-radius: 10px; overflow: hidden; box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+    display: none;
+  }
+  #vorschlaege div { padding: 9px 14px; font-size: 13px; cursor: pointer; }
+  #vorschlaege div:hover, #vorschlaege div.aktiv { background: rgba(255,255,255,0.18); }
+
+  #hero { text-align: center; margin: 10px 0 18px; }
+  #hero-ort { font-size: 19px; font-weight: 500; }
+  #hero-icon { font-size: 60px; margin: 4px 0; }
+  #hero-temp { font-size: 52px; font-weight: 600; line-height: 1; }
+  #hero-text { font-size: 15px; opacity: 0.9; }
+  #hero-gefuehlt { font-size: 12px; opacity: 0.7; margin-top: 2px; }
+
+  h2 { font-size: 12px; opacity: 0.65; margin: 16px 2px 6px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  #stunden {
+    display: flex; gap: 6px; overflow-x: auto; padding: 10px 4px;
+    background: rgba(255,255,255,0.1); border-radius: 14px;
+  }
+  .stunde { flex: 0 0 auto; width: 50px; text-align: center; font-size: 11px; }
+  .stunde .icon { font-size: 18px; margin: 3px 0; }
+
+  #tage { background: rgba(255,255,255,0.1); border-radius: 14px; overflow: hidden; }
+  .tag {
+    display: flex; align-items: center; padding: 9px 14px; font-size: 13px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .tag:last-child { border-bottom: none; }
+  .tag .wochentag { width: 70px; opacity: 0.9; }
+  .tag .icon { width: 34px; text-align: center; font-size: 18px; }
+  .tag .beschreibung { flex: 1; opacity: 0.85; font-size: 12px; padding: 0 8px; }
+  .tag .minmax { width: 80px; text-align: right; white-space: nowrap; }
+  .tag .minmax .min { opacity: 0.6; }
+
+  #details {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .karte {
+    background: rgba(255,255,255,0.1); border-radius: 14px; padding: 10px 14px;
+  }
+  .karte .label { font-size: 11px; opacity: 0.65; }
+  .karte .wert { font-size: 20px; font-weight: 600; margin-top: 2px; }
+
+  #fehler {
+    display: none; text-align: center; padding: 40px 12px; font-size: 14px; opacity: 0.9;
+  }
+  #fehler code { background: rgba(255,255,255,0.15); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <div id="suche">
+    <input id="ort-eingabe" type="text" placeholder="Ort eingeben, z. B. Frankfurt" autocomplete="off">
+    <button id="such-knopf">Suchen</button>
+    <div id="vorschlaege"></div>
+  </div>
+
+  <div id="lade-hinweis">⏳ Lade aktuelles Wetter …</div>
+
+  <div id="inhalt" style="display:none">
+    <div id="hero">
+      <div id="hero-ort"></div>
+      <div id="hero-icon"></div>
+      <div id="hero-temp"></div>
+      <div id="hero-text"></div>
+      <div id="hero-gefuehlt"></div>
+      <div id="jacke"></div>
+    </div>
+
+    <h2>Heute, stündlich</h2>
+    <div id="stunden"></div>
+
+    <h2>7 Tage</h2>
+    <div id="tage"></div>
+
+    <h2>Details</h2>
+    <div id="details">
+      <div class="karte"><div class="label">💨 Wind</div><div class="wert" id="d-wind"></div></div>
+      <div class="karte"><div class="label">💧 Luftfeuchtigkeit</div><div class="wert" id="d-feuchte"></div></div>
+      <div class="karte"><div class="label">☀️ UV-Index (Tageshöchstwert)</div><div class="wert" id="d-uv"></div></div>
+      <div class="karte"><div class="label">🌅 Sonnenauf-/untergang</div><div class="wert" id="d-sonne" style="font-size:14px"></div></div>
+    </div>
+  </div>
+
+  <div id="fehler"></div>
+
+  <script src="js/wettercodes.js"></script>
+  <script src="js/animation.js"></script>
+  <script src="js/renderer.js"></script>
+</body>
+</html>
